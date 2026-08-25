@@ -9,15 +9,6 @@ from zoneinfo import ZoneInfo
 from openai import OpenAI
 
 
-# 現在のGitHub配置:
-#
-# rheum-hatena-auto/
-# ├── generate_article.py
-# ├── post_hatena.py
-# ├── prompt.md
-# ├── history.json
-# └── ...
-#
 ROOT = Path(__file__).resolve().parent
 
 HISTORY = ROOT / "history.json"
@@ -35,23 +26,7 @@ def load_history():
         return {"posts": []}
 
 
-def strip_code_fence(text: str) -> str:
-    """
-    モデルが誤って ```json ... ``` を付けた場合に除去する。
-    """
-    text = text.strip()
-
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-    return text.strip()
-
-
 def remove_tracking_params_from_url(url: str) -> str:
-    """
-    URLから utm_* などの不要なtracking parameterを除去する。
-    """
     try:
         parts = urlsplit(url)
 
@@ -89,10 +64,6 @@ def remove_tracking_params_from_url(url: str) -> str:
 
 
 def clean_tracking_links(html_text: str) -> str:
-    """
-    HTML本文中の href URL から tracking parameter を除去する。
-    """
-
     pattern = re.compile(
         r'href=(["\'])(https?://[^"\']+)\1',
         flags=re.IGNORECASE,
@@ -109,10 +80,6 @@ def clean_tracking_links(html_text: str) -> str:
 
 
 def validate_html_body(body_html: str):
-    """
-    Markdown記法や不要なReferences欄が残っていないか確認する。
-    """
-
     if not body_html or len(body_html.strip()) < 300:
         raise RuntimeError("body_html is unexpectedly short.")
 
@@ -134,10 +101,6 @@ def validate_html_body(body_html: str):
 
 
 def collect_urls(obj):
-    """
-    Web検索で取得したURLを監査用に抽出する。
-    ブログ本文には自動追加しない。
-    """
     urls = set()
 
     def walk(x):
@@ -187,7 +150,6 @@ def main():
 
     history = load_history()
 
-    # 直近40投稿を重複回避用に利用
     recent_posts = history.get("posts", [])[-40:]
 
     today = datetime.now(
@@ -235,9 +197,6 @@ def main():
 
 日本での承認、保険適用、用量を断定する場合は、
 海外情報だけで判断せず、可能な限り国内一次情報を確認してください。
-
-最終回答は prompt.md で指定した
-JSONオブジェクトのみ返してください。
 """
 
     response = client.responses.create(
@@ -270,7 +229,37 @@ JSONオブジェクトのみ返してください。
             "verbosity": os.getenv(
                 "OPENAI_VERBOSITY",
                 "medium",
-            )
+            ),
+            "format": {
+                "type": "json_schema",
+                "name": "rheumatology_article",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string"
+                        },
+                        "body_html": {
+                            "type": "string"
+                        },
+                        "categories": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "minItems": 1,
+                            "maxItems": 3
+                        }
+                    },
+                    "required": [
+                        "title",
+                        "body_html",
+                        "categories"
+                    ],
+                    "additionalProperties": False
+                }
+            }
         },
 
         max_tool_calls=max_tool_calls,
@@ -281,9 +270,7 @@ JSONオブジェクトのみ返してください。
         ],
     )
 
-    raw_text = strip_code_fence(
-        response.output_text
-    )
+    raw_text = response.output_text.strip()
 
     try:
         article = json.loads(raw_text)
@@ -293,29 +280,6 @@ JSONオブジェクトのみ返してください。
             "Model output was not valid JSON.\n\n"
             f"{raw_text}"
         ) from exc
-
-    required_keys = {
-        "title",
-        "body_html",
-        "categories",
-    }
-
-    missing_keys = required_keys - set(article.keys())
-
-    if missing_keys:
-        raise RuntimeError(
-            "Missing required JSON keys: "
-            + ", ".join(sorted(missing_keys))
-        )
-
-    if not isinstance(article["title"], str):
-        raise RuntimeError("title must be a string.")
-
-    if not isinstance(article["body_html"], str):
-        raise RuntimeError("body_html must be a string.")
-
-    if not isinstance(article["categories"], list):
-        raise RuntimeError("categories must be a list.")
 
     article["title"] = article["title"].strip()
 
@@ -333,7 +297,6 @@ JSONオブジェクトのみ返してください。
         article["body_html"]
     )
 
-    # Web検索で実際に参照されたURLを監査用に保存
     try:
         response_dict = response.model_dump()
 
