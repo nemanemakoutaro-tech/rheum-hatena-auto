@@ -45,7 +45,9 @@ def collect_urls(obj):
 
 def main():
     api_key = os.environ["OPENAI_API_KEY"]
-    model = os.getenv("OPENAI_MODEL", "gpt-5")
+    model = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+    max_tool_calls = int(os.getenv("OPENAI_MAX_TOOL_CALLS", "2"))
+    max_output_tokens = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "4500"))
     client = OpenAI(api_key=api_key)
 
     history = load_history()
@@ -73,7 +75,7 @@ def main():
         model=model,
         tools=[{
             "type": "web_search",
-            "search_context_size": "high",
+            "search_context_size": os.getenv("OPENAI_SEARCH_CONTEXT", "medium"),
             "user_location": {
                 "type": "approximate",
                 "country": "JP",
@@ -81,6 +83,11 @@ def main():
             }
         }],
         input=user_input,
+        reasoning={"effort": os.getenv("OPENAI_REASONING_EFFORT", "low")},
+        text={"verbosity": os.getenv("OPENAI_VERBOSITY", "medium")},
+        max_tool_calls=max_tool_calls,
+        max_output_tokens=max_output_tokens,
+        include=["web_search_call.action.sources"],
     )
 
     raw = strip_fence(response.output_text)

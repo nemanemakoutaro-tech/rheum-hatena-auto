@@ -1,5 +1,23 @@
 # 膠原病・リウマチ一人抄読会 → はてなブログ自動投稿
 
+## 月500円程度を目標にした低コスト設定
+
+この版はデフォルトで `gpt-5.4-mini` を使用し、Web検索を1実行あたり最大2 tool calls、出力を最大4500 tokens、reasoningを `low` に制限します。
+
+GitHub Actions の Repository Variables で以下を変更できます。通常は変更不要です。
+
+- `OPENAI_MODEL=gpt-5.4-mini`
+- `OPENAI_MAX_TOOL_CALLS=2`
+- `OPENAI_MAX_OUTPUT_TOKENS=4500`
+- `OPENAI_SEARCH_CONTEXT=medium`
+- `OPENAI_REASONING_EFFORT=low`
+- `OPENAI_VERBOSITY=medium`
+
+OpenAIの現行公表価格では、gpt-5.4-mini は入力 $0.75 / 1M tokens、出力 $4.50 / 1M tokens、Web search は $10 / 1,000 calls（加えて検索内容tokenがモデル料金で課金）です。毎日1回・最大2検索に制限しているため、通常利用では月500円前後を狙える設計ですが、為替・実際のtoken量・価格改定により保証はできません。OpenAI Platform側で月次予算アラート/使用上限も設定してください。
+
+品質を上げたい場合は `OPENAI_REASONING_EFFORT=medium`、または `OPENAI_MODEL=gpt-5.6-terra` に変更できますが、料金は上がります。まずこの設定で1〜2週間運用し、記事品質に不足がある場合だけ上げるのを推奨します。
+
+
 毎朝、日本時間 08:00 ごろに GitHub Actions が以下を自動実行します。
 
 1. OpenAI Responses API + Web Search で最新エビデンスを検索
