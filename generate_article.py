@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from openai import OpenAI
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 HISTORY = ROOT / "history.json"
 PROMPT = ROOT / "prompt.md"
 OUT = ROOT / "generated_article.json"
