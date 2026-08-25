@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import requests
 from requests.auth import HTTPBasicAuth
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 ARTICLE = ROOT / "generated_article.json"
 HISTORY = ROOT / "history.json"
 ARTICLES_DIR = ROOT / "articles"
