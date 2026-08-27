@@ -2,8 +2,9 @@ name: Daily Rheumatology Hatena Post
 
 on:
   schedule:
-    # 23:00 UTC = 翌日 08:00 JST
-    - cron: "0 23 * * *"
+    # 23:17 UTC = 翌日 08:17 JST
+    # 毎時00分のGitHub Actions混雑を避ける
+    - cron: "17 23 * * *"
   workflow_dispatch:
 
 permissions:
