@@ -1,7 +1,9 @@
+import html
 import json
 import os
 import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -9,30 +11,13 @@ from zoneinfo import ZoneInfo
 from openai import OpenAI
 
 
-# ============================================================
-# Paths
-# ============================================================
-
-# 現在のGitHub配置:
-#
-# rheum-hatena-auto/
-# ├── generate_article.py
-# ├── post_hatena.py
-# ├── prompt.md
-# ├── history.json
-# └── ...
-#
-# generate_article.py がリポジトリ直下にあるため .parent を使用する。
 ROOT = Path(__file__).resolve().parent
 
 HISTORY = ROOT / "history.json"
 PROMPT = ROOT / "prompt.md"
 OUT = ROOT / "generated_article.json"
+ARTICLES_DIR = ROOT / "articles"
 
-
-# ============================================================
-# History
-# ============================================================
 
 def load_history():
     if not HISTORY.exists():
@@ -46,15 +31,370 @@ def load_history():
         return {"posts": []}
 
 
-# ============================================================
-# URL cleaning
-# ============================================================
+def strip_html_tags(text: str) -> str:
+    text = re.sub(
+        r"<script.*?</script>",
+        " ",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
-def remove_tracking_params_from_url(url: str) -> str:
-    """
-    URLから utm_* などの不要なtracking parameterを除去する。
-    """
+    text = re.sub(
+        r"<style.*?</style>",
+        " ",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
+    text = re.sub(
+        r"<[^>]+>",
+        " ",
+        text,
+    )
+
+    text = html.unescape(text)
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+
+def extract_article_summary(path: Path) -> str:
+    try:
+        raw = path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError:
+        return ""
+
+    h1 = re.findall(
+        r"<h1[^>]*>(.*?)</h1>",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    h2 = re.findall(
+        r"<h2[^>]*>(.*?)</h2>",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    h3 = re.findall(
+        r"<h3[^>]*>(.*?)</h3>",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    parts = []
+
+    for item in h1[:1]:
+        parts.append(
+            strip_html_tags(item)
+        )
+
+    for item in h2[:12]:
+        parts.append(
+            strip_html_tags(item)
+        )
+
+    for item in h3[:8]:
+        parts.append(
+            strip_html_tags(item)
+        )
+
+    if not parts:
+        plain = strip_html_tags(raw)
+        parts.append(
+            plain[:1200]
+        )
+
+    return " / ".join(
+        p for p in parts if p
+    )
+
+
+def build_history_catalog():
+    history = load_history()
+
+    catalog = []
+
+    for post in history.get(
+        "posts",
+        [],
+    ):
+        date = post.get(
+            "date",
+            "",
+        )
+
+        title = post.get(
+            "title",
+            "",
+        )
+
+        categories = post.get(
+            "categories",
+            [],
+        )
+
+        disease = post.get(
+            "disease",
+            "",
+        )
+
+        focus = post.get(
+            "focus",
+            "",
+        )
+
+        clinical_question = post.get(
+            "clinical_question",
+            "",
+        )
+
+        topic_key = post.get(
+            "topic_key",
+            "",
+        )
+
+        category_text = ", ".join(
+            str(x)
+            for x in categories
+        )
+
+        parts = [
+            date,
+            title,
+            disease,
+            focus,
+            clinical_question,
+            topic_key,
+            category_text,
+        ]
+
+        line = " | ".join(
+            str(x).strip()
+            for x in parts
+            if str(x).strip()
+        )
+
+        if line:
+            catalog.append(line)
+
+    if ARTICLES_DIR.exists():
+        for path in sorted(
+            ARTICLES_DIR.glob("*.html")
+        ):
+            summary = extract_article_summary(
+                path
+            )
+
+            if summary:
+                catalog.append(
+                    f"{path.stem} | {summary}"
+                )
+
+    deduped = []
+    seen = set()
+
+    for item in catalog:
+        item = item.strip()
+
+        if not item:
+            continue
+
+        if item in seen:
+            continue
+
+        seen.add(item)
+        deduped.append(item)
+
+    return deduped
+
+
+def normalize_topic_text(text: str) -> str:
+    text = text.lower()
+
+    replacements = {
+        "全身性強皮症": " ssc ",
+        "強皮症": " ssc ",
+        "systemic sclerosis": " ssc ",
+
+        "関節リウマチ": " ra ",
+        "rheumatoid arthritis": " ra ",
+
+        "全身性エリテマトーデス": " sle ",
+        "systemic lupus erythematosus": " sle ",
+
+        "抗好中球細胞質抗体関連血管炎": " aav ",
+        "anca関連血管炎": " aav ",
+        "anca-associated vasculitis": " aav ",
+
+        "顕微鏡的多発血管炎": " mpa ",
+        "多発血管炎性肉芽腫症": " gpa ",
+        "好酸球性多発血管炎性肉芽腫症": " egpa ",
+        "結節性多発動脈炎": " pan ",
+
+        "シェーグレン症候群": " sjogren ",
+        "シェーグレン病": " sjogren ",
+        "sjögren": " sjogren ",
+
+        "炎症性筋疾患": " iim ",
+        "炎症性筋炎": " iim ",
+        "idiopathic inflammatory myopathy": " iim ",
+
+        "巨細胞性動脈炎": " gca ",
+        "giant cell arteritis": " gca ",
+
+        "リウマチ性多発筋痛症": " pmr ",
+        "polymyalgia rheumatica": " pmr ",
+
+        "igg4関連疾患": " igg4rd ",
+        "igg4-related disease": " igg4rd ",
+
+        "心臓": " heart ",
+        "心筋": " heart ",
+        "心病変": " heart ",
+        "心血管": " cardiovascular ",
+
+        "間質性肺疾患": " ild ",
+        "間質性肺炎": " ild ",
+
+        "末梢神経": " peripheralnerve ",
+        "ニューロパチー": " peripheralnerve ",
+        "neuropathy": " peripheralnerve ",
+
+        "筋病変": " muscle ",
+        "筋炎": " muscle ",
+
+        "腎病変": " kidney ",
+        "腎障害": " kidney ",
+
+        "眼病変": " eye ",
+        "眼症状": " eye ",
+
+        "嚥下障害": " dysphagia ",
+        "嚥下": " dysphagia ",
+
+        "スクリーニング": " screening ",
+        "screening": " screening ",
+
+        "維持療法": " maintenance ",
+        "寛解維持": " maintenance ",
+
+        "ステロイド減量": " steroidtaper ",
+        "gc減量": " steroidtaper ",
+
+        "感染症": " infection ",
+        "ワクチン": " vaccine ",
+    }
+
+    for src, dst in replacements.items():
+        text = text.replace(
+            src,
+            dst,
+        )
+
+    text = re.sub(
+        r"https?://\S+",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"[^a-z0-9ぁ-んァ-ヶ一-龥]+",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+
+def char_ngrams(text: str, n=3):
+    compact = re.sub(
+        r"\s+",
+        "",
+        normalize_topic_text(text),
+    )
+
+    if len(compact) < n:
+        return {compact} if compact else set()
+
+    return {
+        compact[i:i + n]
+        for i in range(
+            len(compact) - n + 1
+        )
+    }
+
+
+def semantic_similarity(
+    a: str,
+    b: str,
+) -> float:
+    na = normalize_topic_text(a)
+    nb = normalize_topic_text(b)
+
+    if not na or not nb:
+        return 0.0
+
+    seq = SequenceMatcher(
+        None,
+        na,
+        nb,
+    ).ratio()
+
+    ga = char_ngrams(na)
+    gb = char_ngrams(nb)
+
+    if ga and gb:
+        jaccard = (
+            len(ga & gb)
+            / len(ga | gb)
+        )
+    else:
+        jaccard = 0.0
+
+    return max(
+        seq,
+        jaccard,
+    )
+
+
+def local_duplicate_check(
+    candidate_text: str,
+    history_catalog,
+):
+    best_score = 0.0
+    best_match = ""
+
+    for item in history_catalog:
+        score = semantic_similarity(
+            candidate_text,
+            item,
+        )
+
+        if score > best_score:
+            best_score = score
+            best_match = item
+
+    return best_score, best_match
+
+
+def remove_tracking_params_from_url(
+    url: str,
+) -> str:
     try:
         parts = urlsplit(url)
 
@@ -66,11 +406,11 @@ def remove_tracking_params_from_url(url: str) -> str:
         ):
             lower_key = key.lower()
 
-            # utm_source / utm_medium / utm_campaign など
-            if lower_key.startswith("utm_"):
+            if lower_key.startswith(
+                "utm_"
+            ):
                 continue
 
-            # その他の不要なtracking parameter
             if lower_key in {
                 "source",
                 "campaign",
@@ -80,7 +420,9 @@ def remove_tracking_params_from_url(url: str) -> str:
             }:
                 continue
 
-            query.append((key, value))
+            query.append(
+                (key, value)
+            )
 
         return urlunsplit(
             (
@@ -96,11 +438,9 @@ def remove_tracking_params_from_url(url: str) -> str:
         return url
 
 
-def clean_tracking_links(html_text: str) -> str:
-    """
-    HTML本文中のhref URLからtracking parameterを除去する。
-    """
-
+def clean_tracking_links(
+    html_text: str,
+) -> str:
     pattern = re.compile(
         r'href=(["\'])(https?://[^"\']+)\1',
         flags=re.IGNORECASE,
@@ -110,8 +450,10 @@ def clean_tracking_links(html_text: str) -> str:
         quote = match.group(1)
         url = match.group(2)
 
-        clean_url = remove_tracking_params_from_url(
-            url
+        clean_url = (
+            remove_tracking_params_from_url(
+                url
+            )
         )
 
         return (
@@ -126,44 +468,14 @@ def clean_tracking_links(html_text: str) -> str:
     )
 
 
-# ============================================================
-# Markdown -> HTML fallback
-# ============================================================
-
-def normalize_mixed_markup(text: str) -> str:
-    """
-    AIがbody_html内に誤って混ぜた簡単なMarkdownを
-    HTMLへ自動変換する。
-
-    毎朝の自動運用で軽微なMarkdown混入だけを理由に
-    workflow全体が失敗することを防ぐ。
-    """
-
-    # --------------------------------------------------------
-    # Markdown link
-    #
-    # [PubMed](https://example.com)
-    #
-    # ↓
-    #
-    # <a href="https://example.com">PubMed</a>
-    # --------------------------------------------------------
-
+def normalize_mixed_markup(
+    text: str,
+) -> str:
     text = re.sub(
         r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
         r'<a href="\2">\1</a>',
         text,
     )
-
-    # --------------------------------------------------------
-    # Markdown bold
-    #
-    # **重要**
-    #
-    # ↓
-    #
-    # <strong>重要</strong>
-    # --------------------------------------------------------
 
     text = re.sub(
         r"\*\*(.+?)\*\*",
@@ -172,25 +484,11 @@ def normalize_mixed_markup(text: str) -> str:
         flags=re.DOTALL,
     )
 
-    # --------------------------------------------------------
-    # Markdown italic
-    #
-    # *Ann Rheum Dis.*
-    #
-    # ↓
-    #
-    # <em>Ann Rheum Dis.</em>
-    # --------------------------------------------------------
-
     text = re.sub(
         r"(?<!\*)\*([^*\n]+?)\*(?!\*)",
         r"<em>\1</em>",
         text,
     )
-
-    # --------------------------------------------------------
-    # Markdown heading level 3
-    # --------------------------------------------------------
 
     text = re.sub(
         r"(?m)^###\s+(.+?)\s*$",
@@ -198,36 +496,17 @@ def normalize_mixed_markup(text: str) -> str:
         text,
     )
 
-    # --------------------------------------------------------
-    # Markdown heading level 2
-    # --------------------------------------------------------
-
     text = re.sub(
         r"(?m)^##\s+(.+?)\s*$",
         r"<h2>\1</h2>",
         text,
     )
 
-    # --------------------------------------------------------
-    # Markdown heading level 1
-    # h1はブログ本文では使わずh2へ変換
-    # --------------------------------------------------------
-
     text = re.sub(
         r"(?m)^#\s+(.+?)\s*$",
         r"<h2>\1</h2>",
         text,
     )
-
-    # --------------------------------------------------------
-    # 単独行に残った裸URL
-    #
-    # https://example.com
-    #
-    # ↓
-    #
-    # <p><a href="...">リンク</a></p>
-    # --------------------------------------------------------
 
     text = re.sub(
         r"(?m)^\s*(https?://\S+)\s*$",
@@ -238,37 +517,25 @@ def normalize_mixed_markup(text: str) -> str:
     return text.strip()
 
 
-# ============================================================
-# HTML validation
-# ============================================================
-
-def validate_html_body(body_html: str):
-    """
-    自動補正後にも明らかなMarkdownや不要なSources欄が
-    残っていないか最終確認する。
-    """
-
+def validate_html_body(
+    body_html: str,
+):
     if not body_html:
         raise RuntimeError(
             "body_html is empty."
         )
 
-    if len(body_html.strip()) < 300:
+    if len(
+        body_html.strip()
+    ) < 300:
         raise RuntimeError(
             "body_html is unexpectedly short."
         )
 
     forbidden_patterns = [
-        # Markdown heading
         r"(?m)^\s*#{1,6}\s+",
-
-        # Markdown link
         r"\[[^\]]+\]\(https?://",
-
-        # code fence
         r"```",
-
-        # 不要なSources / References
         r"(?i)<h[1-6][^>]*>\s*Sources?\s*</h[1-6]>",
         r"(?i)<h[1-6][^>]*>\s*References?\s*</h[1-6]>",
         r"(?i)<h[1-6][^>]*>\s*参考文献\s*</h[1-6]>",
@@ -281,46 +548,43 @@ def validate_html_body(body_html: str):
             body_html,
         ):
             raise RuntimeError(
-                "body_html contains an unwanted "
-                f"pattern: {pattern}"
+                "body_html contains "
+                "an unwanted pattern: "
+                f"{pattern}"
             )
 
 
-# ============================================================
-# Web search source collection
-# ============================================================
-
 def collect_urls(obj):
-    """
-    OpenAI Web Searchで実際に取得されたURLを抽出する。
-
-    これは監査・確認用としてgenerated_article.jsonに
-    保存するだけで、ブログ本文末尾には自動追加しない。
-    """
-
     urls = set()
 
     def walk(x):
-        if isinstance(x, dict):
-
+        if isinstance(
+            x,
+            dict,
+        ):
             for key, value in x.items():
-
                 if (
                     key == "url"
-                    and isinstance(value, str)
-                    and value.startswith("http")
+                    and isinstance(
+                        value,
+                        str,
+                    )
+                    and value.startswith(
+                        "http"
+                    )
                 ):
                     urls.add(
                         remove_tracking_params_from_url(
                             value
                         )
                     )
-
                 else:
                     walk(value)
 
-        elif isinstance(x, list):
-
+        elif isinstance(
+            x,
+            list,
+        ):
             for item in x:
                 walk(item)
 
@@ -329,16 +593,336 @@ def collect_urls(obj):
     return sorted(urls)
 
 
-# ============================================================
-# Main
-# ============================================================
+def choose_theme(
+    client,
+    model,
+    history_catalog,
+    today,
+    search_context,
+):
+    history_text = "\n".join(
+        f"- {item}"
+        for item in history_catalog
+    )
+
+    if len(history_text) > 50000:
+        history_text = (
+            history_text[-50000:]
+        )
+
+    selector_prompt = f"""
+あなたはリウマチ・膠原病専門医向け
+抄読会のテーマ選定編集者です。
+
+今日:
+{today.strftime("%Y-%m-%d")}
+
+以下は過去に公開した記事です。
+
+----- 過去記事 -----
+{history_text or "- 過去記事なし"}
+----- 過去記事ここまで -----
+
+
+最新の公開情報を検索し、
+今日扱う価値のある候補を3テーマ作ってください。
+
+最優先:
+・明日の外来・病棟で使える
+・日本で実際に使える診療
+・最近の重要エビデンス
+・過去記事と実質的に重複しない
+
+
+重要:
+タイトル表現だけでなく、
+
+疾患
+臓器
+Clinical Question
+診療判断
+
+が同じなら重複です。
+
+
+単に新しいreviewが出ただけなら、
+同じテーマを再採用しないでください。
+
+
+既出テーマを再採用してよいのは、
+
+・新guideline
+・practice-changing RCT
+・大規模研究
+・新安全性情報
+・日本で新承認
+
+などにより、
+以前の記事から診療が実際に変わる場合だけです。
+
+
+候補ごとに、
+
+disease:
+疾患
+
+focus:
+臓器または診療テーマ
+
+clinical_question:
+臨床疑問
+
+topic_key:
+英数字中心の短いcanonical key
+例:
+ssc-heart-screening
+aav-rituximab-maintenance
+sle-steroid-taper
+
+why_now:
+今取り上げる理由
+
+duplicate_risk:
+low / medium / high
+
+overlap_with:
+重複しそうな過去記事。
+なければ空文字。
+
+practice_changing_update:
+true / false
+
+を判定してください。
+
+
+selected_indexには
+最も価値が高く、
+かつ重複riskがlowの候補を選んでください。
+
+候補が過去テーマと重複する場合は
+別の疾患・臓器・Clinical Questionを探してください。
+"""
+
+    response = client.responses.create(
+        model=model,
+        input=selector_prompt,
+
+        tools=[
+            {
+                "type": "web_search",
+                "search_context_size":
+                    search_context,
+                "user_location": {
+                    "type": "approximate",
+                    "country": "JP",
+                    "timezone": "Asia/Tokyo",
+                },
+            }
+        ],
+
+        reasoning={
+            "effort": "low",
+        },
+
+        text={
+            "verbosity": "low",
+
+            "format": {
+                "type": "json_schema",
+                "name": "theme_selection",
+                "strict": True,
+
+                "schema": {
+                    "type": "object",
+
+                    "properties": {
+                        "candidates": {
+                            "type": "array",
+                            "minItems": 3,
+                            "maxItems": 3,
+
+                            "items": {
+                                "type": "object",
+
+                                "properties": {
+                                    "disease": {
+                                        "type": "string"
+                                    },
+
+                                    "focus": {
+                                        "type": "string"
+                                    },
+
+                                    "clinical_question": {
+                                        "type": "string"
+                                    },
+
+                                    "topic_key": {
+                                        "type": "string"
+                                    },
+
+                                    "why_now": {
+                                        "type": "string"
+                                    },
+
+                                    "duplicate_risk": {
+                                        "type": "string",
+                                        "enum": [
+                                            "low",
+                                            "medium",
+                                            "high",
+                                        ],
+                                    },
+
+                                    "overlap_with": {
+                                        "type": "string"
+                                    },
+
+                                    "practice_changing_update": {
+                                        "type": "boolean"
+                                    },
+                                },
+
+                                "required": [
+                                    "disease",
+                                    "focus",
+                                    "clinical_question",
+                                    "topic_key",
+                                    "why_now",
+                                    "duplicate_risk",
+                                    "overlap_with",
+                                    "practice_changing_update",
+                                ],
+
+                                "additionalProperties":
+                                    False,
+                            },
+                        },
+
+                        "selected_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 2,
+                        },
+                    },
+
+                    "required": [
+                        "candidates",
+                        "selected_index",
+                    ],
+
+                    "additionalProperties":
+                        False,
+                },
+            },
+        },
+
+        max_tool_calls=2,
+        max_output_tokens=1800,
+    )
+
+    selection = json.loads(
+        response.output_text
+    )
+
+    candidates = selection[
+        "candidates"
+    ]
+
+    scored = []
+
+    for index, candidate in enumerate(
+        candidates
+    ):
+        candidate_text = (
+            candidate["disease"]
+            + " "
+            + candidate["focus"]
+            + " "
+            + candidate["clinical_question"]
+            + " "
+            + candidate["topic_key"]
+        )
+
+        score, match = (
+            local_duplicate_check(
+                candidate_text,
+                history_catalog,
+            )
+        )
+
+        candidate[
+            "local_duplicate_score"
+        ] = score
+
+        candidate[
+            "local_closest_match"
+        ] = match
+
+        scored.append(
+            (
+                index,
+                score,
+                candidate,
+            )
+        )
+
+    selected_index = selection[
+        "selected_index"
+    ]
+
+    selected = candidates[
+        selected_index
+    ]
+
+    if (
+        selected["duplicate_risk"]
+        != "low"
+        or (
+            selected[
+                "local_duplicate_score"
+            ] >= 0.48
+            and not selected[
+                "practice_changing_update"
+            ]
+        )
+    ):
+        safe_candidates = [
+            item
+            for item in scored
+            if (
+                item[2][
+                    "duplicate_risk"
+                ] == "low"
+                and (
+                    item[1] < 0.48
+                    or item[2][
+                        "practice_changing_update"
+                    ]
+                )
+            )
+        ]
+
+        if safe_candidates:
+            safe_candidates.sort(
+                key=lambda x: x[1]
+            )
+
+            selected = (
+                safe_candidates[0][2]
+            )
+
+        else:
+            raise RuntimeError(
+                "All proposed themes appear "
+                "to overlap with previous posts. "
+                "No article was generated."
+            )
+
+    return selected
+
 
 def main():
-
-    # --------------------------------------------------------
-    # Environment
-    # --------------------------------------------------------
-
     api_key = os.environ[
         "OPENAI_API_KEY"
     ]
@@ -377,37 +961,15 @@ def main():
         "medium",
     )
 
-    # --------------------------------------------------------
-    # OpenAI client
-    # --------------------------------------------------------
-
     client = OpenAI(
         api_key=api_key
     )
 
-    # --------------------------------------------------------
-    # History
-    # --------------------------------------------------------
-
-    history = load_history()
-
-    # 直近40投稿を重複回避用に利用
-    recent_posts = history.get(
-        "posts",
-        [],
-    )[-40:]
-
-    # --------------------------------------------------------
-    # Date
-    # --------------------------------------------------------
-
     today = datetime.now(
-        ZoneInfo("Asia/Tokyo")
+        ZoneInfo(
+            "Asia/Tokyo"
+        )
     )
-
-    # --------------------------------------------------------
-    # Prompt
-    # --------------------------------------------------------
 
     if not PROMPT.exists():
         raise RuntimeError(
@@ -418,91 +980,160 @@ def main():
         encoding="utf-8"
     )
 
-    if recent_posts:
+    history_catalog = (
+        build_history_catalog()
+    )
 
-        history_text = "\n".join(
-            (
-                f"- {post.get('date', '')}: "
-                f"{post.get('title', '')}"
+    selected_theme = choose_theme(
+        client=client,
+        model=model,
+        history_catalog=history_catalog,
+        today=today,
+        search_context=search_context,
+    )
+
+    print(
+        "Selected theme: "
+        + selected_theme[
+            "clinical_question"
+        ]
+    )
+
+    print(
+        "Topic key: "
+        + selected_theme[
+            "topic_key"
+        ]
+    )
+
+    print(
+        "Closest previous topic score: "
+        + str(
+            round(
+                selected_theme.get(
+                    "local_duplicate_score",
+                    0.0,
+                ),
+                3,
             )
-            for post in recent_posts
+        )
+    )
+
+    if selected_theme.get(
+        "local_closest_match"
+    ):
+        print(
+            "Closest previous article: "
+            + selected_theme[
+                "local_closest_match"
+            ][:300]
         )
 
-    else:
+    history_text = "\n".join(
+        f"- {item}"
+        for item in history_catalog
+    )
 
+    if len(history_text) > 50000:
         history_text = (
-            "- 過去投稿なし"
+            history_text[-50000:]
         )
 
     user_input = f"""
 {base_prompt}
 
-今日の日付（日本時間）:
+
+今日の日付:
 {today.strftime("%Y-%m-%d")}
 
-直近の投稿履歴:
-{history_text}
 
-上記履歴と同一または非常に近いテーマは避けてください。
+今回の記事テーマはすでに編集工程で決定済みです。
+
+
+疾患:
+{selected_theme["disease"]}
+
+
+focus:
+{selected_theme["focus"]}
+
+
+Clinical Question:
+{selected_theme["clinical_question"]}
+
+
+topic_key:
+{selected_theme["topic_key"]}
+
+
+このテーマを今日取り上げる理由:
+{selected_theme["why_now"]}
+
+
+過去記事との重複候補:
+{selected_theme["overlap_with"] or "なし"}
+
+
+過去記事とのローカル類似度:
+{selected_theme.get("local_duplicate_score", 0.0):.3f}
+
+
+最も近い過去記事:
+{selected_theme.get("local_closest_match", "") or "なし"}
+
+
+practice-changing update:
+{selected_theme["practice_changing_update"]}
+
+
+以下は過去記事一覧です。
+
+----- 過去記事 -----
+{history_text or "- 過去記事なし"}
+----- 過去記事ここまで -----
+
+
+上記過去記事と同じ内容を繰り返さないでください。
+
+
+今回のClinical Questionだけに集中してください。
+
+
+過去と関連するテーマの場合でも、
+過去記事で既に説明済みの一般論を長く繰り返さず、
+
+「今回新たに分かったこと」
+
+を中心にしてください。
+
 
 最新の公開情報をWeb検索し、
-今日もっとも実臨床的価値の高いテーマを選んでください。
+原著論文、guideline、PMDA等を確認してください。
 
-検索時は以下を優先してください。
 
-- PubMed
-- 出版社の原著論文ページ
-- EULAR / ACR / BSR 等の公式学会文書
-- PMDA
-- 国内電子添文
-- 日本リウマチ学会等の国内学会資料
+日本での承認、
+保険適用、
+用量
 
-日本での承認、保険適用、用量を断定する場合は、
-海外情報だけで判断せず、
-可能な限り国内一次情報を確認してください。
+を断定する場合は、
+可能な限り国内一次情報で確認してください。
 
-特に海外研究の薬剤用量や治療戦略が
-日本の標準的な診療と異なる場合は、
-その違いを明確にしてください。
 
-記事はMarkdownではなくHTML本文として作成してください。
+本文は読みやすいHTMLにしてください。
 
-リンクは本文中に乱立させず、
-原則として「③ 論文情報」に集約してください。
 
-URLを裸で表示せず、
-PubMed、原著論文、Free full text、PMDAなど
-短いリンク名を使用してください。
-
-段落は原則2〜4文程度とし、
-見出しの前後では必ず段落を分けてください。
+最終回答は指定JSONのみ返してください。
 """
 
-    # --------------------------------------------------------
-    # Responses API
-    #
-    # Structured Outputsで以下を強制:
-    #
-    # title
-    # body_html
-    # categories
-    #
-    # これによりJSONのキー揺れを防止する。
-    # --------------------------------------------------------
-
     response = client.responses.create(
-
         model=model,
-
         input=user_input,
 
         tools=[
             {
                 "type": "web_search",
-
                 "search_context_size":
                     search_context,
-
                 "user_location": {
                     "type": "approximate",
                     "country": "JP",
@@ -522,43 +1153,29 @@ PubMed、原著論文、Free full text、PMDAなど
 
             "format": {
                 "type": "json_schema",
-
                 "name":
                     "rheumatology_article",
-
-                "strict":
-                    True,
+                "strict": True,
 
                 "schema": {
-                    "type":
-                        "object",
+                    "type": "object",
 
                     "properties": {
-
                         "title": {
-                            "type":
-                                "string",
+                            "type": "string",
                         },
 
                         "body_html": {
-                            "type":
-                                "string",
+                            "type": "string",
                         },
 
                         "categories": {
-                            "type":
-                                "array",
-
+                            "type": "array",
                             "items": {
-                                "type":
-                                    "string",
+                                "type": "string",
                             },
-
-                            "minItems":
-                                1,
-
-                            "maxItems":
-                                3,
+                            "minItems": 1,
+                            "maxItems": 3,
                         },
                     },
 
@@ -585,105 +1202,32 @@ PubMed、原著論文、Free full text、PMDAなど
         ],
     )
 
-    # --------------------------------------------------------
-    # Parse JSON
-    # --------------------------------------------------------
-
     raw_text = (
         response.output_text.strip()
     )
 
     try:
-
         article = json.loads(
             raw_text
         )
 
     except json.JSONDecodeError as exc:
-
         raise RuntimeError(
             "Model output was not valid JSON."
             "\n\n"
             f"{raw_text}"
         ) from exc
 
-    # --------------------------------------------------------
-    # Basic validation
-    # --------------------------------------------------------
-
-    required_keys = {
-        "title",
-        "body_html",
-        "categories",
-    }
-
-    missing_keys = (
-        required_keys
-        - set(article.keys())
-    )
-
-    if missing_keys:
-
-        raise RuntimeError(
-            "Missing required JSON keys: "
-            + ", ".join(
-                sorted(missing_keys)
-            )
-        )
-
-    if not isinstance(
-        article["title"],
-        str,
-    ):
-        raise RuntimeError(
-            "title must be a string."
-        )
-
-    if not isinstance(
-        article["body_html"],
-        str,
-    ):
-        raise RuntimeError(
-            "body_html must be a string."
-        )
-
-    if not isinstance(
-        article["categories"],
-        list,
-    ):
-        raise RuntimeError(
-            "categories must be a list."
-        )
-
-    # --------------------------------------------------------
-    # Title
-    # --------------------------------------------------------
-
     article["title"] = (
         article["title"].strip()
     )
 
-    # --------------------------------------------------------
-    # Categories
-    # --------------------------------------------------------
-
     article["categories"] = [
         str(category).strip()
-
         for category
         in article["categories"]
-
         if str(category).strip()
     ][:3]
-
-    # --------------------------------------------------------
-    # HTML normalization
-    #
-    # 重要:
-    #
-    # AIが誤ってMarkdownを混ぜても、
-    # 軽微なものは自動的にHTMLへ変換する。
-    # --------------------------------------------------------
 
     article["body_html"] = (
         normalize_mixed_markup(
@@ -693,10 +1237,6 @@ PubMed、原著論文、Free full text、PMDAなど
         )
     )
 
-    # --------------------------------------------------------
-    # Tracking parameter除去
-    # --------------------------------------------------------
-
     article["body_html"] = (
         clean_tracking_links(
             article[
@@ -705,25 +1245,51 @@ PubMed、原著論文、Free full text、PMDAなど
         )
     )
 
-    # --------------------------------------------------------
-    # 最終HTML validation
-    # --------------------------------------------------------
-
     validate_html_body(
         article[
             "body_html"
         ]
     )
 
-    # --------------------------------------------------------
-    # Search sources
-    #
-    # ブログ本文には追加せず、
-    # generated_article.json内に監査用保存。
-    # --------------------------------------------------------
+    final_topic_text = (
+        selected_theme[
+            "disease"
+        ]
+        + " "
+        + selected_theme[
+            "focus"
+        ]
+        + " "
+        + selected_theme[
+            "clinical_question"
+        ]
+        + " "
+        + article[
+            "title"
+        ]
+    )
+
+    final_score, final_match = (
+        local_duplicate_check(
+            final_topic_text,
+            history_catalog,
+        )
+    )
+
+    if (
+        final_score >= 0.60
+        and not selected_theme[
+            "practice_changing_update"
+        ]
+    ):
+        raise RuntimeError(
+            "Final article still appears "
+            "too similar to a previous post. "
+            f"Similarity={final_score:.3f}; "
+            f"Closest={final_match[:500]}"
+        )
 
     try:
-
         response_dict = (
             response.model_dump()
         )
@@ -735,57 +1301,85 @@ PubMed、原著論文、Free full text、PMDAなど
         )
 
     except Exception:
-
         searched_sources = []
 
     if searched_sources:
-
         article[
             "searched_sources"
         ] = searched_sources
 
-    # --------------------------------------------------------
-    # Metadata
-    # --------------------------------------------------------
+    article[
+        "topic_key"
+    ] = selected_theme[
+        "topic_key"
+    ]
 
-    article["date"] = (
-        today.strftime(
-            "%Y-%m-%d"
-        )
+    article[
+        "disease"
+    ] = selected_theme[
+        "disease"
+    ]
+
+    article[
+        "focus"
+    ] = selected_theme[
+        "focus"
+    ]
+
+    article[
+        "clinical_question"
+    ] = selected_theme[
+        "clinical_question"
+    ]
+
+    article[
+        "duplicate_score"
+    ] = final_score
+
+    article[
+        "closest_previous_topic"
+    ] = final_match
+
+    article[
+        "date"
+    ] = today.strftime(
+        "%Y-%m-%d"
     )
 
-    article["generated_at"] = (
-        today.isoformat()
-    )
-
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
+    article[
+        "generated_at"
+    ] = today.isoformat()
 
     OUT.write_text(
-
         json.dumps(
             article,
             ensure_ascii=False,
             indent=2,
         ),
-
         encoding="utf-8",
     )
 
     print(
-        f"Generated: "
-        f"{article['title']}"
+        "Generated: "
+        + article[
+            "title"
+        ]
+    )
+
+    print(
+        "Final duplicate score: "
+        + str(
+            round(
+                final_score,
+                3,
+            )
+        )
     )
 
     print(
         f"Saved to: {OUT}"
     )
 
-
-# ============================================================
-# Entry point
-# ============================================================
 
 if __name__ == "__main__":
     main()
