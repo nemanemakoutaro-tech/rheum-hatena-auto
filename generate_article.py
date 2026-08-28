@@ -2,13 +2,14 @@ import html
 import json
 import os
 import re
+import time
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 
 ROOT = Path(__file__).resolve().parent
@@ -392,6 +393,220 @@ def local_duplicate_check(
     return best_score, best_match
 
 
+def compact_history_for_prompt(
+    history_catalog,
+    per_item_chars=220,
+    max_chars=24000,
+):
+    compact_items = []
+
+    for item in history_catalog:
+        item = re.sub(
+            r"\s+",
+            " ",
+            str(item),
+        ).strip()
+
+        if not item:
+            continue
+
+        if len(item) > per_item_chars:
+            item = item[:per_item_chars].rstrip() + "…"
+
+        compact_items.append(
+            "- " + item
+        )
+
+    text = "\n".join(
+        compact_items
+    )
+
+    if len(text) <= max_chars:
+        return text
+
+    # Keep the newest entries when the compact catalog itself
+    # becomes very large. Full-history duplicate detection is still
+    # performed locally against history_catalog below.
+    selected = []
+    total = 0
+
+    for item in reversed(compact_items):
+        cost = len(item) + 1
+
+        if selected and total + cost > max_chars:
+            break
+
+        selected.append(item)
+        total += cost
+
+    selected.reverse()
+
+    return "\n".join(selected)
+
+
+def closest_history_items(
+    selected_theme,
+    history_catalog,
+    limit=8,
+):
+    query = (
+        selected_theme.get("disease", "")
+        + " "
+        + selected_theme.get("focus", "")
+        + " "
+        + selected_theme.get("clinical_question", "")
+        + " "
+        + selected_theme.get("topic_key", "")
+    )
+
+    scored = []
+
+    for item in history_catalog:
+        scored.append(
+            (
+                semantic_similarity(
+                    query,
+                    item,
+                ),
+                item,
+            )
+        )
+
+    scored.sort(
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    return [
+        item
+        for _, item in scored[:limit]
+    ]
+
+
+def parse_rate_limit_wait_seconds(exc):
+    response = getattr(
+        exc,
+        "response",
+        None,
+    )
+
+    headers = getattr(
+        response,
+        "headers",
+        None,
+    )
+
+    if headers:
+        retry_after = headers.get(
+            "retry-after"
+        )
+
+        if retry_after:
+            try:
+                return max(
+                    1.0,
+                    float(retry_after),
+                )
+            except (TypeError, ValueError):
+                pass
+
+    message = str(exc)
+
+    match = re.search(
+        r"try again in\s*"
+        r"(?:(\d+)h)?"
+        r"(?:(\d+)m)?"
+        r"([0-9.]+)s",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    if match:
+        hours = int(
+            match.group(1) or 0
+        )
+        minutes = int(
+            match.group(2) or 0
+        )
+        seconds = float(
+            match.group(3) or 0
+        )
+
+        return (
+            hours * 3600
+            + minutes * 60
+            + seconds
+        )
+
+    return None
+
+
+def create_response_with_rate_limit_retry(
+    client,
+    operation_name,
+    max_attempts=3,
+    **kwargs,
+):
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.responses.create(
+                **kwargs
+            )
+
+        except RateLimitError as exc:
+            last_error = exc
+
+            if attempt >= max_attempts:
+                break
+
+            requested_wait = (
+                parse_rate_limit_wait_seconds(
+                    exc
+                )
+            )
+
+            fallback_wait = 20 * attempt
+
+            if requested_wait is None:
+                wait_seconds = fallback_wait
+            else:
+                # Do not leave a GitHub Actions runner sleeping for
+                # hours. After reducing prompt size, ordinary TPM
+                # collisions should clear with a short delay.
+                wait_seconds = min(
+                    max(requested_wait, 5.0),
+                    90.0,
+                )
+
+            print(
+                f"Rate limit during {operation_name} "
+                f"(attempt {attempt}/{max_attempts}). "
+                f"Retrying in {wait_seconds:.1f}s."
+            )
+
+            if (
+                requested_wait is not None
+                and requested_wait > 90
+            ):
+                print(
+                    "API suggested a longer wait "
+                    f"({requested_wait:.1f}s); capped at 90s "
+                    "to avoid tying up the Actions runner."
+                )
+
+            time.sleep(
+                wait_seconds
+            )
+
+    raise RuntimeError(
+        f"{operation_name} failed after "
+        f"{max_attempts} attempts because of "
+        "OpenAI rate limits."
+    ) from last_error
+
+
 def remove_tracking_params_from_url(
     url: str,
 ) -> str:
@@ -600,15 +815,11 @@ def choose_theme(
     today,
     search_context,
 ):
-    history_text = "\n".join(
-        f"- {item}"
-        for item in history_catalog
-    )
-
-    if len(history_text) > 50000:
-        history_text = (
-            history_text[-50000:]
+    history_text = (
+        compact_history_for_prompt(
+            history_catalog
         )
+    )
 
     selector_prompt = f"""
 あなたはリウマチ・膠原病専門医向け
@@ -617,7 +828,9 @@ def choose_theme(
 今日:
 {today.strftime("%Y-%m-%d")}
 
-以下は過去に公開した記事です。
+以下は過去に公開した記事の圧縮一覧です。
+重複判定自体は、この一覧とは別に全履歴を用いて
+ローカルでも再確認します。
 
 ----- 過去記事 -----
 {history_text or "- 過去記事なし"}
@@ -708,122 +921,129 @@ selected_indexには
     last_raw_text = ""
 
     for attempt in range(1, 4):
-        response = client.responses.create(
-            model=model,
-            input=selector_prompt,
+        response = (
+            create_response_with_rate_limit_retry(
+                client=client,
+                operation_name=(
+                    "theme selection"
+                ),
+                max_attempts=3,
+                model=model,
+                input=selector_prompt,
 
-            tools=[
-                {
-                    "type": "web_search",
-                    "search_context_size":
-                        search_context,
-                    "user_location": {
-                        "type": "approximate",
-                        "country": "JP",
-                        "timezone": "Asia/Tokyo",
-                    },
-                }
-            ],
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size":
+                            search_context,
+                        "user_location": {
+                            "type": "approximate",
+                            "country": "JP",
+                            "timezone": "Asia/Tokyo",
+                        },
+                    }
+                ],
 
-            reasoning={
-                "effort": "low",
-            },
+                reasoning={
+                    "effort": "low",
+                },
 
-            text={
-                "verbosity": "low",
+                text={
+                    "verbosity": "low",
 
-                "format": {
-                    "type": "json_schema",
-                    "name": "theme_selection",
-                    "strict": True,
+                    "format": {
+                        "type": "json_schema",
+                        "name": "theme_selection",
+                        "strict": True,
 
-                    "schema": {
-                        "type": "object",
+                        "schema": {
+                            "type": "object",
 
-                        "properties": {
-                            "candidates": {
-                                "type": "array",
-                                "minItems": 3,
-                                "maxItems": 3,
+                            "properties": {
+                                "candidates": {
+                                    "type": "array",
+                                    "minItems": 3,
+                                    "maxItems": 3,
 
-                                "items": {
-                                    "type": "object",
+                                    "items": {
+                                        "type": "object",
 
-                                    "properties": {
-                                        "disease": {
-                                            "type": "string"
+                                        "properties": {
+                                            "disease": {
+                                                "type": "string"
+                                            },
+
+                                            "focus": {
+                                                "type": "string"
+                                            },
+
+                                            "clinical_question": {
+                                                "type": "string"
+                                            },
+
+                                            "topic_key": {
+                                                "type": "string"
+                                            },
+
+                                            "why_now": {
+                                                "type": "string"
+                                            },
+
+                                            "duplicate_risk": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "low",
+                                                    "medium",
+                                                    "high",
+                                                ],
+                                            },
+
+                                            "overlap_with": {
+                                                "type": "string"
+                                            },
+
+                                            "practice_changing_update": {
+                                                "type": "boolean"
+                                            },
                                         },
 
-                                        "focus": {
-                                            "type": "string"
-                                        },
+                                        "required": [
+                                            "disease",
+                                            "focus",
+                                            "clinical_question",
+                                            "topic_key",
+                                            "why_now",
+                                            "duplicate_risk",
+                                            "overlap_with",
+                                            "practice_changing_update",
+                                        ],
 
-                                        "clinical_question": {
-                                            "type": "string"
-                                        },
-
-                                        "topic_key": {
-                                            "type": "string"
-                                        },
-
-                                        "why_now": {
-                                            "type": "string"
-                                        },
-
-                                        "duplicate_risk": {
-                                            "type": "string",
-                                            "enum": [
-                                                "low",
-                                                "medium",
-                                                "high",
-                                            ],
-                                        },
-
-                                        "overlap_with": {
-                                            "type": "string"
-                                        },
-
-                                        "practice_changing_update": {
-                                            "type": "boolean"
-                                        },
+                                        "additionalProperties":
+                                            False,
                                     },
+                                },
 
-                                    "required": [
-                                        "disease",
-                                        "focus",
-                                        "clinical_question",
-                                        "topic_key",
-                                        "why_now",
-                                        "duplicate_risk",
-                                        "overlap_with",
-                                        "practice_changing_update",
-                                    ],
-
-                                    "additionalProperties":
-                                        False,
+                                "selected_index": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 2,
                                 },
                             },
 
-                            "selected_index": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": 2,
-                            },
+                            "required": [
+                                "candidates",
+                                "selected_index",
+                            ],
+
+                            "additionalProperties":
+                                False,
                         },
-
-                        "required": [
-                            "candidates",
-                            "selected_index",
-                        ],
-
-                        "additionalProperties":
-                            False,
                     },
                 },
-            },
 
-            max_tool_calls=2,
-            max_output_tokens=4000,
+                max_tool_calls=2,
+                max_output_tokens=4000,
+            )
         )
 
         last_raw_text = (
@@ -1062,15 +1282,20 @@ def main():
             ][:300]
         )
 
-    history_text = "\n".join(
-        f"- {item}"
-        for item in history_catalog
+    relevant_history = (
+        closest_history_items(
+            selected_theme,
+            history_catalog,
+            limit=8,
+        )
     )
 
-    if len(history_text) > 50000:
-        history_text = (
-            history_text[-50000:]
+    relevant_history_text = (
+        "\n".join(
+            "- " + item[:500]
+            for item in relevant_history
         )
+    )
 
     user_input = f"""
 {base_prompt}
@@ -1119,11 +1344,12 @@ practice-changing update:
 {selected_theme["practice_changing_update"]}
 
 
-以下は過去記事一覧です。
+以下は今回のテーマに近い過去記事だけを抽出した一覧です。
+全履歴との重複判定はすでにローカルで実施済みです。
 
------ 過去記事 -----
-{history_text or "- 過去記事なし"}
------ 過去記事ここまで -----
+----- 関連する過去記事 -----
+{relevant_history_text or "- 関連記事なし"}
+----- 関連する過去記事ここまで -----
 
 
 上記過去記事と同じ内容を繰り返さないでください。
@@ -1158,81 +1384,88 @@ practice-changing update:
 最終回答は指定JSONのみ返してください。
 """
 
-    response = client.responses.create(
-        model=model,
-        input=user_input,
+    response = (
+        create_response_with_rate_limit_retry(
+            client=client,
+            operation_name=(
+                "article generation"
+            ),
+            max_attempts=3,
+            model=model,
+            input=user_input,
 
-        tools=[
-            {
-                "type": "web_search",
-                "search_context_size":
-                    search_context,
-                "user_location": {
-                    "type": "approximate",
-                    "country": "JP",
-                    "timezone": "Asia/Tokyo",
-                },
-            }
-        ],
+            tools=[
+                {
+                    "type": "web_search",
+                    "search_context_size":
+                        search_context,
+                    "user_location": {
+                        "type": "approximate",
+                        "country": "JP",
+                        "timezone": "Asia/Tokyo",
+                    },
+                }
+            ],
 
-        reasoning={
-            "effort":
-                reasoning_effort,
-        },
+            reasoning={
+                "effort":
+                    reasoning_effort,
+            },
 
-        text={
-            "verbosity":
-                verbosity,
+            text={
+                "verbosity":
+                    verbosity,
 
-            "format": {
-                "type": "json_schema",
-                "name":
-                    "rheumatology_article",
-                "strict": True,
+                "format": {
+                    "type": "json_schema",
+                    "name":
+                        "rheumatology_article",
+                    "strict": True,
 
-                "schema": {
-                    "type": "object",
+                    "schema": {
+                        "type": "object",
 
-                    "properties": {
-                        "title": {
-                            "type": "string",
-                        },
-
-                        "body_html": {
-                            "type": "string",
-                        },
-
-                        "categories": {
-                            "type": "array",
-                            "items": {
+                        "properties": {
+                            "title": {
                                 "type": "string",
                             },
-                            "minItems": 1,
-                            "maxItems": 3,
+
+                            "body_html": {
+                                "type": "string",
+                            },
+
+                            "categories": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                },
+                                "minItems": 1,
+                                "maxItems": 3,
+                            },
                         },
+
+                        "required": [
+                            "title",
+                            "body_html",
+                            "categories",
+                        ],
+
+                        "additionalProperties":
+                            False,
                     },
-
-                    "required": [
-                        "title",
-                        "body_html",
-                        "categories",
-                    ],
-
-                    "additionalProperties":
-                        False,
                 },
             },
-        },
 
-        max_tool_calls=
-            max_tool_calls,
+            max_tool_calls=
+                max_tool_calls,
 
-        max_output_tokens=
-            max_output_tokens,
+            max_output_tokens=
+                max_output_tokens,
 
-        include=[
-            "web_search_call.action.sources"
-        ],
+            include=[
+                "web_search_call.action.sources"
+            ],
+        )
     )
 
     raw_text = (
