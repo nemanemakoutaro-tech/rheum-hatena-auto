@@ -703,127 +703,160 @@ selected_indexには
 別の疾患・臓器・Clinical Questionを探してください。
 """
 
-    response = client.responses.create(
-        model=model,
-        input=selector_prompt,
+    selection = None
+    last_error = None
+    last_raw_text = ""
 
-        tools=[
-            {
-                "type": "web_search",
-                "search_context_size":
-                    search_context,
-                "user_location": {
-                    "type": "approximate",
-                    "country": "JP",
-                    "timezone": "Asia/Tokyo",
-                },
-            }
-        ],
+    for attempt in range(1, 4):
+        response = client.responses.create(
+            model=model,
+            input=selector_prompt,
 
-        reasoning={
-            "effort": "low",
-        },
+            tools=[
+                {
+                    "type": "web_search",
+                    "search_context_size":
+                        search_context,
+                    "user_location": {
+                        "type": "approximate",
+                        "country": "JP",
+                        "timezone": "Asia/Tokyo",
+                    },
+                }
+            ],
 
-        text={
-            "verbosity": "low",
+            reasoning={
+                "effort": "low",
+            },
 
-            "format": {
-                "type": "json_schema",
-                "name": "theme_selection",
-                "strict": True,
+            text={
+                "verbosity": "low",
 
-                "schema": {
-                    "type": "object",
+                "format": {
+                    "type": "json_schema",
+                    "name": "theme_selection",
+                    "strict": True,
 
-                    "properties": {
-                        "candidates": {
-                            "type": "array",
-                            "minItems": 3,
-                            "maxItems": 3,
+                    "schema": {
+                        "type": "object",
 
-                            "items": {
-                                "type": "object",
+                        "properties": {
+                            "candidates": {
+                                "type": "array",
+                                "minItems": 3,
+                                "maxItems": 3,
 
-                                "properties": {
-                                    "disease": {
-                                        "type": "string"
+                                "items": {
+                                    "type": "object",
+
+                                    "properties": {
+                                        "disease": {
+                                            "type": "string"
+                                        },
+
+                                        "focus": {
+                                            "type": "string"
+                                        },
+
+                                        "clinical_question": {
+                                            "type": "string"
+                                        },
+
+                                        "topic_key": {
+                                            "type": "string"
+                                        },
+
+                                        "why_now": {
+                                            "type": "string"
+                                        },
+
+                                        "duplicate_risk": {
+                                            "type": "string",
+                                            "enum": [
+                                                "low",
+                                                "medium",
+                                                "high",
+                                            ],
+                                        },
+
+                                        "overlap_with": {
+                                            "type": "string"
+                                        },
+
+                                        "practice_changing_update": {
+                                            "type": "boolean"
+                                        },
                                     },
 
-                                    "focus": {
-                                        "type": "string"
-                                    },
+                                    "required": [
+                                        "disease",
+                                        "focus",
+                                        "clinical_question",
+                                        "topic_key",
+                                        "why_now",
+                                        "duplicate_risk",
+                                        "overlap_with",
+                                        "practice_changing_update",
+                                    ],
 
-                                    "clinical_question": {
-                                        "type": "string"
-                                    },
-
-                                    "topic_key": {
-                                        "type": "string"
-                                    },
-
-                                    "why_now": {
-                                        "type": "string"
-                                    },
-
-                                    "duplicate_risk": {
-                                        "type": "string",
-                                        "enum": [
-                                            "low",
-                                            "medium",
-                                            "high",
-                                        ],
-                                    },
-
-                                    "overlap_with": {
-                                        "type": "string"
-                                    },
-
-                                    "practice_changing_update": {
-                                        "type": "boolean"
-                                    },
+                                    "additionalProperties":
+                                        False,
                                 },
+                            },
 
-                                "required": [
-                                    "disease",
-                                    "focus",
-                                    "clinical_question",
-                                    "topic_key",
-                                    "why_now",
-                                    "duplicate_risk",
-                                    "overlap_with",
-                                    "practice_changing_update",
-                                ],
-
-                                "additionalProperties":
-                                    False,
+                            "selected_index": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 2,
                             },
                         },
 
-                        "selected_index": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 2,
-                        },
+                        "required": [
+                            "candidates",
+                            "selected_index",
+                        ],
+
+                        "additionalProperties":
+                            False,
                     },
-
-                    "required": [
-                        "candidates",
-                        "selected_index",
-                    ],
-
-                    "additionalProperties":
-                        False,
                 },
             },
-        },
 
-        max_tool_calls=2,
-        max_output_tokens=1800,
-    )
+            max_tool_calls=2,
+            max_output_tokens=4000,
+        )
 
-    selection = json.loads(
-        response.output_text
-    )
+        last_raw_text = (
+            response.output_text or ""
+        ).strip()
+
+        try:
+            selection = json.loads(
+                last_raw_text
+            )
+            break
+
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            print(
+                "Theme selection JSON parse failed "
+                f"(attempt {attempt}/3): {exc}"
+            )
+
+            if attempt < 3:
+                print(
+                    "Retrying theme selection..."
+                )
+
+    if selection is None:
+        preview = last_raw_text[-1200:]
+
+        raise RuntimeError(
+            "Theme selection failed after 3 attempts. "
+            "The model repeatedly returned invalid or "
+            "truncated JSON. Last output tail:\n"
+            + preview
+        ) from last_error
 
     candidates = selection[
         "candidates"
